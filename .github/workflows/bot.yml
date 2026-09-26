@@ -1,0 +1,94 @@
+name: Telegram admin bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    # fallback watchdog: every 30 min make sure the bot is alive
+    - cron: "*/30 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: telegram-bot
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Guard against overlapping bot runs
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OTHERS() {
+            gh api "repos/${{ github.repository }}/actions/workflows/bot.yml/runs?per_page=20" \
+              --jq '[.workflow_runs[] | select(.id != ${{ github.run_id }} and (.status == "in_progress" or .status == "queued"))] | length'
+          }
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Watchdog tick: start only if no other run is active or queued.
+            N=$(OTHERS)
+            echo "other_runs=$N"
+            if [ "$N" != "0" ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; fi
+          else
+            # Restart/manual run: wait out the predecessor's teardown (its bot
+            # already exited), then proceed so the chain never breaks itself.
+            for i in $(seq 1 30); do
+              N=$(OTHERS)
+              echo "wait $i: other_runs=$N"
+              if [ "$N" = "0" ]; then break; fi
+              sleep 10
+            done
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Run bot (exits after 5h20m)
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_REPO: Pashawilliams/bez-mezh-site
+          GH_BRANCH: main
+          SITE_URL: http://bez-mezh.pp.ua/
+          MAX_RUNTIME: "19200"
+          # Optional but recommended: add repository secret STATE_SECRET to store
+          # bot/state.json encrypted instead of only public-redacted runtime offsets.
+          STATE_SECRET: ${{ secrets.STATE_SECRET }}
+          NOTIFY_START: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: python bot.py
+
+      - name: Restart myself
+        if: always() && steps.guard.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_CHAT: ${{ secrets.ADMIN_ID }}
+        run: |
+          sleep 20
+          # Crash-loop breaker: if 3+ of the previous 4 runs failed, do NOT chain
+          # (the 30-min cron watchdog keeps retrying once per tick instead).
+          PREV_FAILS=$(gh api "repos/${{ github.repository }}/actions/workflows/bot.yml/runs?per_page=5" \
+            --jq '[.workflow_runs[1:5][] | select(.conclusion == "failure")] | length')
+          echo "previous_failures=${PREV_FAILS:-0}"
+          if [ "${PREV_FAILS:-0}" -ge 3 ]; then
+            echo "Too many consecutive failures - NOT chaining a new run."
+            if [ "$PREV_FAILS" = "3" ]; then
+              CHAT="${ADMIN_CHAT:-7906546417}"
+              curl -s --max-time 20 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${CHAT}" \
+                --data-urlencode "text=🚨 Админ-бот bez-mezh падает при старте 3 раза подряд. Автоперезапуск остановлен, нужен фикс." || true
+            fi
+            exit 0
+          fi
+          gh workflow run bot.yml --ref main || true
