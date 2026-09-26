@@ -317,7 +317,8 @@ def main_menu():
         [("🛣 Маршруты", "routes:0"), ("💶 Цены", "pricing"), ("⭐ Отзывы", "reviews"), ("❓ FAQ", "faq")],
         [("🏠 Главная", "hero"), ("👤 Менеджеры", "managers")],
         [(("📢 Объявление ✓" if an.get("enabled") else "📢 Объявление"), "announce"), (m, "maint")],
-        [("👥 Админы", "admins"), ("📊 Журнал", "stats"), ("🌐 Сайт", "open")],
+        [("👥 Админы", "admins"), ("📊 Журнал", "stats")],
+        [("📣 Рассылка", "cast"), ("🌐 Сайт", "open")],
     ])
 
 
@@ -723,8 +724,26 @@ def stats_view(msg_id=None):
     st = store.state
     logs = st.get("log", [])[-10:]
     leads = st.get("leads", [])
+    today = dt.datetime.utcnow().strftime("%Y-%m-%d")
+    week_ago = dt.datetime.utcnow() - dt.timedelta(days=7)
+    n_today = n_week = n_open = 0
+    by_kind = {}
+    for _l in leads:
+        try:
+            _d = dt.datetime.fromisoformat((_l.get("t") or "")[:19])
+        except Exception:
+            continue
+        if (_l.get("t") or "")[:10] == today:
+            n_today += 1
+        if _d >= week_ago:
+            n_week += 1
+        if not _l.get("done"):
+            n_open += 1
+        _k = _l.get("kind") or "?"
+        by_kind[_k] = by_kind.get(_k, 0) + 1
+    kinds = ", ".join(f"{k}: {v}" for k, v in sorted(by_kind.items(), key=lambda x: -x[1])[:6])
     txt = (f"<b>Журнал</b>\n📥 {len(leads)} заявок · 👥 {len(admin_ids())} админов\n"
-           f"⏱ бот работает {int((time.time()-START)/60)} мин\n\n" + ("\n".join(f"• {esc(l['t'][5:16].replace('T',' '))} {esc(l['msg'])}" for l in logs) or "—"))
+           f"📊 Сегодня: {n_today} · 7 дней: {n_week} · необработано: {n_open}\n" + (f"<i>{esc(kinds)}</i>\n" if kinds else "") + f"⏱ бот работает {int((time.time()-START)/60)} мин\n\n" + ("\n".join(f"• {esc(l['t'][5:16].replace('T',' '))} {esc(l['msg'])}" for l in logs) or "—"))
     kb = ikb([[("♻️ Перечитать данные", "reload"), ("💾 Бэкап", "backup")], [("⬅️ Меню", "main")]])
     (edit if msg_id else send)(*((msg_id, txt, kb) if msg_id else (txt, kb)))
 
@@ -751,6 +770,14 @@ KINDS = {"booking": "🎫 Бронирование рейса", "manager": "📞
 
 
 FIELD_RU = {"Імʼя": "Имя", "Телефон": "Телефон", "Маршрут": "Маршрут", "Звідки": "Откуда", "Куди": "Куда", "Дата рейсу": "Дата рейса", "Дата": "Дата", "Дата відправлення": "Дата отправления", "Час відправлення": "Время отправления", "Пасажирів": "Пассажиры", "Тип посилки": "Тип посылки", "Email": "Email", "Відгук": "Отзыв", "Крок": "Шаг"}
+FIELD_RU["\u0406\u043c\u044f"] = "Имя"
+
+
+def _norm_key(k):
+    if isinstance(k, str):
+        for _a in ("\u02bc", "\u2019", "\u2018", "\u0060", "\u0027"):
+            k = k.replace(_a, "")
+    return k
 
 
 def fmt_lead(ev):
@@ -766,7 +793,7 @@ def fmt_lead(ev):
     for k in order + [k for k in fields if k not in order]:
         if k in fields and k not in seen and fields[k]:
             seen.add(k)
-            lines.append(f"▫️ {esc(FIELD_RU.get(k, k))}: <b>{esc(fields[k])}</b>")
+            lines.append(f"▫️ {esc(FIELD_RU.get(k, FIELD_RU.get(_norm_key(k), k)))}: <b>{esc(fields[k])}</b>")
     ctx = lead.get("context") or {}
     if ctx:
         lines.append("")
@@ -788,14 +815,41 @@ def on_bridge_event(ev):
         _l = ev.get("lead") or {}
         _f = _l.get("fields") or {}
         _summary = ", ".join(f"{k}: {v}" for k, v in _f.items()) if _f else json.dumps(_l, ensure_ascii=False)
-        store.state.setdefault("leads", []).append({"t": ev.get("ts") or dt.datetime.utcnow().isoformat(), "kind": KINDS.get(_l.get("type"), _l.get("type") or ""), "text": _summary[:700]})
+        store.state.setdefault("leads", []).append({"t": ev.get("ts") or dt.datetime.utcnow().isoformat(), "kind": KINDS.get(_l.get("type"), _l.get("type") or ""), "text": _summary[:700], "fields": _f, "type": _l.get("type") or "", "done": False, "rem": 0})
         store.state["leads"] = store.state["leads"][-200:]
         mark_dirty()
         idx = len(store.state["leads"]) - 1
-        rows = [[("✅ Обработано", f"lead_done:{idx}")]]
+        if (_l.get("type") or "") == "review":
+            rows = [[("✅ Опубликовать", f"revpub:{idx}"), ("❌ Отклонить", f"revrej:{idx}")]]
+        else:
+            rows = [[("✅ Обработано", f"lead_done:{idx}")]]
         broadcast(fmt_lead(ev), ikb(rows))
 
 
+
+
+def reminder_loop(stop):
+    while not stop["flag"]:
+        try:
+            time.sleep(1800)
+            if stop["flag"]:
+                break
+            now = dt.datetime.utcnow()
+            for i, _l in enumerate(store.state.get("leads", [])):
+                try:
+                    if _l.get("done") or (_l.get("rem") or 0) >= 3:
+                        continue
+                    _t = dt.datetime.fromisoformat((_l.get("t") or "")[:19])
+                    if (now - _t).total_seconds() < 1800:
+                        continue
+                    _l["rem"] = (_l.get("rem") or 0) + 1
+                    broadcast(f"⏰ <b>Напоминание</b>: заявка {_l.get('kind') or ''} без обработки уже {int((now-_t).total_seconds()/60)} мин.\n\n{esc((_l.get('text') or '')[:400])}",
+                              ikb([[("✅ Обработано", f"lead_done:{i}")]]))
+                except Exception:
+                    continue
+            mark_dirty()
+        except Exception:
+            log.exception("reminder loop failed")
 
 
 def bridge_listener(stop):
@@ -1028,6 +1082,24 @@ def handle_callback(cq):
         return stats_view(msg_id)
     if data == "admins":
         return admins_view(msg_id)
+    if data == "cast":
+        pending[cur_chat()] = dict(action="cast")
+        return send("Текст рассылки всем админам:", ikb([[("✖️ Отмена", "cancel")]]))
+    if data == "cast_yes":
+        p = pending.pop(cur_chat(), {}) or {}
+        if p.get("action") != "cast_ok" or not p.get("text"):
+            return show_main(msg_id)
+        n = 0
+        for uid in admin_ids():
+            try:
+                send("📣 <b>Рассылка</b>\n\n" + esc(p["text"]), chat_id=uid)
+                n += 1
+            except Exception:
+                pass
+        return edit(msg_id, f"✅ Разослано админам: {n}.", ikb([[("⬅️ Меню", "main")]]))
+    if data == "cast_no":
+        pending.pop(cur_chat(), None)
+        return show_main(msg_id)
     if data == "admin_add":
         if not is_owner(cur_chat()):
             return send("Только владелец может добавлять администраторов.")
@@ -1062,6 +1134,36 @@ def handle_callback(cq):
         if 0 <= i < len(ls):
             ls[i]["done"] = False; mark_dirty()
         return edit(msg_id, "Заявка возвращена в работу.", ikb([[("✅ Обработано", f"lead_done:{i}")]]))
+    if data.startswith("revpub:"):
+        i = int(data.split(":")[1]); ls = store.state.get("leads", [])
+        if 0 <= i < len(ls):
+            _f = {_norm_key(_k): _v for _k, _v in (ls[i].get("fields") or {}).items()}
+            try:
+                stars = max(1, min(5, int(str(_f.get("\u041e\u0446\u0456\u043d\u043a\u0430") or _f.get("Оценка") or "5").strip()[0])))
+            except Exception:
+                stars = 5
+            t = ls[i].get("t") or ""
+            day = (t[8:10] + "." + t[5:7] + "." + t[:4]) if len(t) >= 10 and t[4:5] == "-" else t[:10]
+            r = {"name": str(_f.get("\u0406\u043c\u044f") or _f.get("Имя") or "Гость").strip() or "Гость",
+                 "date": day, "text": str(_f.get("\u0412\u0456\u0434\u0433\u0443\u043a") or _f.get("Отзыв") or "").strip(), "stars": stars}
+            store.data["reviews"].insert(0, r)
+            store.save(f"publish review {r['name']}")
+            ls[i]["done"] = True; mark_dirty()
+        try:
+            edit(msg_id, "✅ Отзыв опубликован на сайте.", None)
+        except Exception:
+            pass
+        return
+
+    if data.startswith("revrej:"):
+        i = int(data.split(":")[1]); ls = store.state.get("leads", [])
+        if 0 <= i < len(ls):
+            ls[i]["done"] = True; mark_dirty()
+        try:
+            edit(msg_id, "❌ Отзыв отклонён.", None)
+        except Exception:
+            pass
+        return
     if data == "leads":
         leads = store.state.get("leads", [])[-10:]
         def _fmt(l):
@@ -1107,6 +1209,12 @@ def handle_text(text):
 
     a = p["action"]
     try:
+        if a == "cast":
+            if not text.strip():
+                return send("❌ Пустое сообщение. Введите текст или /cancel")
+            pending[cur_chat()] = dict(action="cast_ok", text=text.strip())
+            return send(f"Разослать {len(admin_ids())} админам?\n\n{esc(text.strip())}",
+                        ikb([[("✅ Разослать", "cast_yes"), ("✖️ Отмена", "cast_no")]]))
         if a == "admin_add":
             parts = text.strip().split(None, 1)
             uid = int(parts[0])
@@ -1314,6 +1422,7 @@ def main():
     stop = {"flag": False}
     signal.signal(signal.SIGTERM, lambda *a: stop.__setitem__("flag", True))
     threading.Thread(target=bridge_listener, args=(stop,), daemon=True).start()
+    threading.Thread(target=reminder_loop, args=(stop,), daemon=True).start()
     last_state_save = time.time()
     while not stop["flag"] and time.time() - START < MAX_RUNTIME:
         try:
