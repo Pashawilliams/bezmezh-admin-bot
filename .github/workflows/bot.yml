@@ -65,7 +65,6 @@ jobs:
           # Optional but recommended: add repository secret STATE_SECRET to store
           # bot/state.json encrypted instead of only public-redacted runtime offsets.
           STATE_SECRET: ${{ secrets.STATE_SECRET }}
-          NOTIFY_START: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python bot.py
 
       - name: Restart myself

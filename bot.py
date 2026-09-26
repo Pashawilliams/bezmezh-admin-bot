@@ -22,6 +22,7 @@ import datetime as dt
 import urllib.request
 import urllib.parse
 import urllib.error
+import re
 import threading
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -79,20 +80,44 @@ def cur_chat():
     return getattr(CTX, "chat", None) or OWNER_ID
 
 
+def _clip(text, limit=3900):
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    cut = re.sub(r"&[A-Za-z0-9#]*$", "", text[:limit])
+    return cut + "\u2026"
+
+
+def _plain(text):
+    t = re.sub(r"<[^>]*>", "", str(text))
+    return t.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#039;", "'").replace("&amp;", "&")
+
+
 def send(text, kb=None, chat_id=None, parse="HTML"):
+    text = _clip(text)
     p = {"chat_id": chat_id or cur_chat(), "text": text, "parse_mode": parse, "disable_web_page_preview": True}
     if kb:
         p["reply_markup"] = kb
-    return tg("sendMessage", **p)
+    r = tg("sendMessage", **p)
+    if not r.get("ok") and parse == "HTML":
+        p2 = {"chat_id": p["chat_id"], "text": _clip(_plain(text)), "disable_web_page_preview": True}
+        if kb:
+            p2["reply_markup"] = kb
+        r = tg("sendMessage", **p2)
+    return r
 
 
 def edit(msg_id, text, kb=None, chat_id=None):
+    text = _clip(text)
     p = {"chat_id": chat_id or cur_chat(), "message_id": msg_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if kb:
         p["reply_markup"] = kb
     r = tg("editMessageText", **p)
-    if not r.get("ok"):
-        send(text, kb, chat_id)
+    if r.get("ok"):
+        return
+    if "not modified" in str(r.get("error", "")):
+        return
+    send(text, kb, chat_id)
 
 
 def ikb(rows):
@@ -283,9 +308,31 @@ pending = {}  # chat_id -> {"action":..., ...}
 state_dirty = {"flag": False}
 
 
+def _aid(a):
+    try:
+        return int((a or {}).get("id"))
+    except Exception:
+        return None
+
+
+def _idx(v, n):
+    try:
+        i = int(v)
+    except Exception:
+        return None
+    return i if 0 <= i < n else None
+
+
+def _stars(r):
+    try:
+        return "\u2605" * max(1, min(5, int(str(r.get("stars", 5)).strip()[0])))
+    except Exception:
+        return "\u2605" * 5
+
+
 def admin_ids():
-    ids = [OWNER_ID] + [int(a["id"]) for a in store.state.get("admins", [])]
-    return list(dict.fromkeys(ids))
+    ids = [OWNER_ID] + [_aid(a) for a in store.state.get("admins", [])]
+    return list(dict.fromkeys(i for i in ids if i is not None))
 
 
 def is_admin(uid):
@@ -363,9 +410,11 @@ def routes_view(page, msg_id=None):
 
 
 def route_view(i, msg_id=None):
+    if not (0 <= i < len(store.data["routes"])):
+        return routes_view(0, msg_id)
     _r = store.data["routes"][i]
     _pc = price_for(_r["from"], _r["to"], "comfort"); _pl = price_for(_r["from"], _r["to"], "lux")
-    _auto = (f"\n🕒 В пути ~{_pc['hours']} ч · Comfort (08:00) €{_pc['eur']} ≈ {_pc['uah']} ₴ · Lux (18:00) €{_pl['eur']} ≈ {_pl['uah']} ₴" if _pc else "\n⚠️ Время в пути ещё не рассчитано (💶 Цены → Пересчитать)")
+    _auto = (f"\n🕒 В пути ~{_pc['hours']} ч · Comfort (08:00) €{_pc['eur']} ≈ {_pc['uah']} ₴ · Lux (18:00) €{_pl['eur']} ≈ {_pl['uah']} ₴" if (_pc and _pl) else "\n⚠️ Время в пути ещё не рассчитано (💶 Цены → Пересчитать)")
     r = store.data["routes"][i]
     vis = "🚫 Скрыть" if r.get("visible", True) else "✅ Показать"
     txt = (f"<b>{esc(r['from'])} → {esc(r['to'])}</b>\n"
@@ -383,16 +432,16 @@ def route_view(i, msg_id=None):
 
 
 def reviews_view(msg_id=None):
-    rows = [[(f"{r['name']} · {r.get('date','')} · {'★'*int(r.get('stars',5))}", f"review:{i}")] for i, r in enumerate(store.data["reviews"])]
+    rows = [[(f"{(r.get('name') or '?')[:40]} · {r.get('date','')} · {_stars(r)}", f"review:{i}")] for i, r in enumerate(store.data["reviews"][:40])]
     rows.append([("➕ Добавить отзыв", "review_add"), ("⬅️ Меню", "main")])
-    txt = "<b>Отзывы</b>\n" + "\n\n".join(f"<b>{esc(r['name'])}</b> ({esc(r.get('date',''))}): {esc(r['text'][:120])}…" for r in store.data["reviews"])
+    txt = "<b>Отзывы</b>\n" + "\n\n".join(f"<b>{esc(r.get('name') or '?')}</b> ({esc(r.get('date',''))}): {esc((r.get('text') or '')[:120])}…" for r in store.data["reviews"])
     (edit if msg_id else send)(*((msg_id, txt, ikb(rows)) if msg_id else (txt, ikb(rows))))
 
 
 def faq_view(msg_id=None):
-    rows = [[(f"{i+1}. {f['q'][:40]}", f"faqi:{i}")] for i, f in enumerate(store.data["faq"])]
+    rows = [[(f"{i+1}. {(f.get('q') or '?')[:40]}", f"faqi:{i}")] for i, f in enumerate(store.data["faq"][:40])]
     rows.append([("➕ Добавить вопрос", "faq_add"), ("⬅️ Меню", "main")])
-    txt = "<b>FAQ</b> (первый вопрос показывается большой карточкой):\n\n" + "\n".join(f"{i+1}. {esc(f['q'])}" for i, f in enumerate(store.data["faq"]))
+    txt = "<b>FAQ</b> (первый вопрос показывается большой карточкой):\n\n" + "\n".join(f"{i+1}. {esc(f.get('q') or '?')}" for i, f in enumerate(store.data["faq"]))
     (edit if msg_id else send)(*((msg_id, txt, ikb(rows)) if msg_id else (txt, ikb(rows))))
 
 
@@ -431,9 +480,9 @@ def manager_view(i, msg_id=None):
     m = ms[i]
     txt = (f"{_mgr_fmt(m)}\nTelegram: {esc(m.get('telegram','') or 'авто (по номеру)')}\nWhatsApp: {esc(m.get('whatsapp','') or 'авто (по номеру)')}")
     kb = ikb([
-        [("✏️ Имя", f"mset:{i}:name"), ("✏️ Посада", f"mset:{i}:role")],
+        [("✏️ Имя", f"mset:{i}:name"), ("✏️ Должность", f"mset:{i}:role")],
         [("📱 Телефон", f"mset:{i}:phone"), ("✈️ Telegram", f"mset:{i}:telegram"), ("💬 WhatsApp", f"mset:{i}:whatsapp")],
-        [("⬆️ Вище", f"mup:{i}"), ("🗑 Удалить", f"mdel:{i}"), ("⬅️ Назад", "managers")],
+        [("⬆️ Выше", f"mup:{i}"), ("🗑 Удалить", f"mdel:{i}"), ("⬅️ Назад", "managers")],
     ])
     (edit if msg_id else send)(*((msg_id, txt, kb) if msg_id else (txt, kb)))
 
@@ -627,6 +676,22 @@ def pricing_cfg():
     p.setdefault("currency", "UAH"); p.setdefault("eur_rate", 51.8); p.setdefault("rate_auto", True); p.setdefault("extra_hours", 3)
     p.setdefault("tiers", [[6,8,90,120],[8,10,100,140],[10,12,130,170],[12,14,140,180],[14,16,150,190],[16,18,160,200],[18,20,160,200],[20,22,170,210],[22,24,180,220],[24,27,190,230],[27,30,200,240],[30,33,210,250],[33,36,210,250],[36,39,220,260],[39,42,230,270],[42,45,240,280],[45,999,250,290]])
     p.setdefault("discounts", [{"label": "Пенсіонерам", "pct": 10}, {"label": "Дітям", "pct": 15}])
+    try:
+        _tiers_ok = isinstance(p.get("tiers"), list) and sum(1 for _row in p["tiers"] if isinstance(_row, (list, tuple)) and len(_row) >= 4) >= 2
+    except Exception:
+        _tiers_ok = False
+    if not _tiers_ok:
+        p.pop("tiers", None)
+        p.setdefault("tiers", [[6,8,90,120],[8,10,100,140],[10,12,130,170],[12,14,140,180],[14,16,150,190],[16,18,160,200],[18,20,160,200],[20,22,170,210],[22,24,180,220],[24,27,190,230],[27,30,200,240],[30,33,210,250],[33,36,210,250],[36,39,220,260],[39,42,230,270],[42,45,240,280],[45,999,250,290]])
+    try:
+        p["eur_rate"] = float(p.get("eur_rate", 51.8))
+        assert 1 < p["eur_rate"] < 1000
+    except Exception:
+        p["eur_rate"] = 51.8
+    try:
+        p["extra_hours"] = float(p.get("extra_hours", 3))
+    except Exception:
+        p["extra_hours"] = 3
     return p
 
 
@@ -634,13 +699,19 @@ def price_for(frm, to, cls="comfort"):
     p = pricing_cfg()
     dur = store.data.get("durations", {})
     k = dur.get(f"{frm}|{to}") or dur.get(f"{to}|{frm}")
-    if not k:
+    if not isinstance(k, dict):
         return None
-    h = k["hours"]
+    try:
+        h = float(k["hours"])
+    except Exception:
+        return None
     t = None
     for row in p["tiers"]:
-        if row[0] <= h < row[1]:
-            t = row; break
+        try:
+            if len(row) >= 4 and row[0] <= h < row[1]:
+                t = row; break
+        except Exception:
+            continue
     if t is None:
         t = p["tiers"][0] if h < p["tiers"][0][0] else p["tiers"][-1]
     eur = t[3] if cls == "lux" else t[2]
@@ -724,8 +795,14 @@ def stats_view(msg_id=None):
     st = store.state
     logs = st.get("log", [])[-10:]
     leads = st.get("leads", [])
-    today = dt.datetime.utcnow().strftime("%Y-%m-%d")
-    week_ago = dt.datetime.utcnow() - dt.timedelta(days=7)
+    try:
+        from zoneinfo import ZoneInfo
+        _off = dt.datetime.now(ZoneInfo("Europe/Kyiv")).utcoffset() or dt.timedelta(0)
+    except Exception:
+        _off = dt.timedelta(0)
+    _now = dt.datetime.utcnow() + _off
+    today = _now.strftime("%Y-%m-%d")
+    week_ago = _now - dt.timedelta(days=7)
     n_today = n_week = n_open = 0
     by_kind = {}
     for _l in leads:
@@ -809,20 +886,42 @@ def fmt_lead(ev):
     return "\n".join(lines)
 
 
+def _new_lid():
+    return base64.urlsafe_b64encode(os.urandom(6)).decode()
+
+
+def _lead_by_ref(ref):
+    ls = store.state.get("leads", [])
+    for i, l in enumerate(ls):
+        if l.get("lid") == ref:
+            return i, l
+    try:
+        i = int(ref)
+        if 0 <= i < len(ls):
+            return i, ls[i]
+    except Exception:
+        pass
+    return None, None
+
+
 def on_bridge_event(ev):
     kind = ev.get("kind")
     if kind == "lead":
         _l = ev.get("lead") or {}
         _f = _l.get("fields") or {}
+        if not _f and not any(_l.get(k) for k in ("name", "phone", "direction", "date", "time", "price_text", "email")):
+            log.warning("bridge: empty lead event, skipped")
+            return
         _summary = ", ".join(f"{k}: {v}" for k, v in _f.items()) if _f else json.dumps(_l, ensure_ascii=False)
-        store.state.setdefault("leads", []).append({"t": ev.get("ts") or dt.datetime.utcnow().isoformat(), "kind": KINDS.get(_l.get("type"), _l.get("type") or ""), "text": _summary[:700], "fields": _f, "type": _l.get("type") or "", "done": False, "rem": 0})
+        _entry = {"t": ev.get("ts") or dt.datetime.utcnow().isoformat(), "kind": KINDS.get(_l.get("type"), _l.get("type") or ""), "text": _summary[:700], "fields": _f, "type": _l.get("type") or "", "done": False, "rem": 0,
+                  "lid": _new_lid()}
+        store.state.setdefault("leads", []).append(_entry)
         store.state["leads"] = store.state["leads"][-200:]
         mark_dirty()
-        idx = len(store.state["leads"]) - 1
         if (_l.get("type") or "") == "review":
-            rows = [[("✅ Опубликовать", f"revpub:{idx}"), ("❌ Отклонить", f"revrej:{idx}")]]
+            rows = [[("✅ Опубликовать", f"revpub:{_entry['lid']}"), ("❌ Отклонить", f"revrej:{_entry['lid']}")]]
         else:
-            rows = [[("✅ Обработано", f"lead_done:{idx}")]]
+            rows = [[("✅ Обработано", f"lead_done:{_entry['lid']}")]]
         broadcast(fmt_lead(ev), ikb(rows))
 
 
@@ -844,9 +943,20 @@ def reminder_loop(stop):
                         continue
                     _l["rem"] = (_l.get("rem") or 0) + 1
                     broadcast(f"⏰ <b>Напоминание</b>: заявка {_l.get('kind') or ''} без обработки уже {int((now-_t).total_seconds()/60)} мин.\n\n{esc((_l.get('text') or '')[:400])}",
-                              ikb([[("✅ Обработано", f"lead_done:{i}")]]))
+                              ikb([[("✅ Обработано", f"lead_done:{_l.get('lid') or i}")]]))
                 except Exception:
                     continue
+            try:
+                _p = pricing_cfg()
+                _last = float(store.state.get("rate_fetched") or 0)
+                if _p.get("rate_auto", True) and time.time() - _last > 6 * 3600:
+                    _r = fetch_eur_rate()
+                    if _r:
+                        _p["eur_rate"] = round(_r, 2)
+                        store.state["rate_fetched"] = time.time()
+                        store.save("pricing auto rate")
+            except Exception:
+                log.exception("auto rate failed")
             mark_dirty()
         except Exception:
             log.exception("reminder loop failed")
@@ -859,6 +969,11 @@ def bridge_listener(stop):
         log.warning("bridge inbox not configured")
         return
     since = store.state.get("bridge_since") or "5m"
+    try:
+        seen = set((store.state.get("bridge_seen") or [])[-50:])
+    except Exception:
+        seen = set()
+    errs = 0
     while not stop["flag"]:
         try:
             req = urllib.request.Request(NTFY + topic + "/json?since=" + urllib.parse.quote(str(since)), headers={"User-Agent": "site-admin-bot"})
@@ -875,8 +990,17 @@ def bridge_listener(stop):
                         continue
                     if d.get("event") != "message":
                         continue
-                    since = d.get("id") or since
+                    mid = d.get("id") or ""
+                    if mid and mid in seen:
+                        since = mid
+                        store.state["bridge_since"] = since
+                        continue
+                    if mid:
+                        seen.add(mid)
+                        store.state["bridge_seen"] = sorted(seen)[-50:]
+                    since = mid or since
                     store.state["bridge_since"] = since
+                    mark_dirty()
                     try:
                         ev = json.loads(d.get("message") or "{}")
                     except Exception:
@@ -885,15 +1009,20 @@ def bridge_listener(stop):
                         on_bridge_event(ev)
                     except Exception:
                         log.exception("bridge event failed")
+            errs = 0
         except Exception as e:
+            errs += 1
             log.warning("bridge stream error: %s", e)
+            if errs >= 3:
+                since = "5m"
+                errs = 0
             time.sleep(5)
 
 
 # ----------------------------------------------------------------- handlers
 
 def ask(action, prompt, **extra):
-    pending[cur_chat()] = dict(action=action, **extra)
+    pending[cur_chat()] = dict(action=action, ts=time.time(), **extra)
     send(prompt, ikb([[("✖️ Отмена", "cancel")]]))
 
 
@@ -911,7 +1040,11 @@ def handle_callback(cq):
     if data == "open":
         return send(f"🌐 {SITE_URL}?v={int(time.time())}")
     if data == "reload":
-        store.load()
+        try:
+            store.load()
+        except Exception as e:
+            log.warning("reload failed: %s", e)
+            return send("❌ Не удалось обновить данные.", main_menu())
         tg("answerCallbackQuery", callback_query_id=cq["id"], text="Данные обновлены")
         return show_main(msg_id)
     if data == "backup":
@@ -922,20 +1055,27 @@ def handle_callback(cq):
     if data.startswith("route:"):
         return route_view(int(data.split(":")[1]), msg_id)
     if data.startswith("rtoggle:"):
-        i = int(data.split(":")[1])
+        i = _idx(data.split(":")[1], len(store.data["routes"]))
+        if i is None:
+            return routes_view(0, msg_id)
         r = store.data["routes"][i]
         r["visible"] = not r.get("visible", True)
         store.save(f"route {r['from']}→{r['to']} visible={r['visible']}")
         return route_view(i, msg_id)
     if data.startswith("rdel:"):
-        i = int(data.split(":")[1])
+        i = _idx(data.split(":")[1], len(store.data["routes"]))
+        if i is None:
+            return routes_view(0, msg_id)
         r = store.data["routes"].pop(i)
         store.save(f"delete route {r['from']}→{r['to']}")
         return routes_view(0, msg_id)
     if data.startswith("rset:"):
         _, i, field = data.split(":")
         names = {"price": "Цена, грн:", "old_price": "Старая цена (0 — убрать):", "badge": "Бейдж (напр. ХІТ) или «-»:"}
-        return ask("rset", names[field], i=int(i), field=field)
+        i = _idx(i, len(store.data["routes"]))
+        if i is None or field not in names:
+            return routes_view(0, msg_id)
+        return ask("rset", names[field], i=i, field=field)
     if data == "route_add":
         return ask("route_add", "Формат: <code>Київ - Варшава</code>. Время в пути и цена рассчитаются автоматически.")
     if data == "bulk":
@@ -946,26 +1086,37 @@ def handle_callback(cq):
         pct = float(data.split(":")[1])
         for r in store.data["routes"]:
             for k in ("price", "old_price"):
-                if r.get(k):
-                    r[k] = int(round(r[k] * (1 + pct / 100) / 100.0) * 100)
+                try:
+                    v = float(r.get(k) or 0)
+                except Exception:
+                    continue
+                if v > 0:
+                    r[k] = int(round(v * (1 + pct / 100) / 100.0) * 100)
         store.save(f"bulk prices {pct:+.0f}%")
         tg("answerCallbackQuery", callback_query_id=cq["id"], text=f"Готово: {pct:+.0f}%")
         return routes_view(0, msg_id)
     if data.startswith("radj:"):
         _, i, dlt = data.split(":")
-        i = int(i); r = store.data["routes"][i]
+        i = _idx(i, len(store.data["routes"]))
+        if i is None:
+            return routes_view(0, msg_id)
+        r = store.data["routes"][i]
         r["price"] = max(0, (r.get("price") or 0) + int(dlt))
         store.save(f"route {r['from']}→{r['to']} price={r['price']}")
         return route_view(i, msg_id)
     if data == "reviews":
         return reviews_view(msg_id)
     if data.startswith("review:"):
-        i = int(data.split(":")[1])
+        i = _idx(data.split(":")[1], len(store.data["reviews"]))
+        if i is None:
+            return reviews_view(msg_id)
         r = store.data["reviews"][i]
-        kb = ikb([[("🗑 Удалить", f"revdel:{i}"), ("⬅️ Назад", "reviews")]])
-        return edit(msg_id, f"<b>{esc(r['name'])}</b> · {esc(r.get('date',''))} · {'★'*int(r.get('stars',5))}\n\n{esc(r['text'])}", kb)
+        kb = ikb([[("🗑 Удалить", f"revdel:{i}"), ("⬅️ Меню", "main")], [("⬅️ Назад", "reviews")]])
+        return edit(msg_id, f"<b>{esc(r.get('name') or '?')}</b> · {esc(r.get('date',''))} · {_stars(r)}\n\n{esc(r.get('text') or '')}", kb)
     if data.startswith("revdel:"):
-        i = int(data.split(":")[1])
+        i = _idx(data.split(":")[1], len(store.data["reviews"]))
+        if i is None:
+            return reviews_view(msg_id)
         r = store.data["reviews"].pop(i)
         store.save(f"delete review {r['name']}")
         return reviews_view(msg_id)
@@ -974,21 +1125,30 @@ def handle_callback(cq):
     if data == "faq":
         return faq_view(msg_id)
     if data.startswith("faqi:"):
-        i = int(data.split(":")[1])
+        i = _idx(data.split(":")[1], len(store.data["faq"]))
+        if i is None:
+            return faq_view(msg_id)
         f = store.data["faq"][i]
         kb = ikb([[("✏️ Вопрос", f"faqset:{i}:q"), ("✏️ Ответ", f"faqset:{i}:a")], [("⬆️ Сделать первым", f"faqtop:{i}"), ("🗑 Удалить", f"faqdel:{i}")], [("⬅️ Назад", "faq")]])
-        return edit(msg_id, f"<b>{esc(f['q'])}</b>\n\n{esc(f['a'])}", kb)
+        return edit(msg_id, f"<b>{esc(f.get('q') or '?')}</b>\n\n{esc(f.get('a') or '')}", kb)
     if data.startswith("faqset:"):
         _, i, field = data.split(":")
-        return ask("faqset", "Введите " + ("новый вопрос:" if field == "q" else "новый ответ:"), i=int(i), field=field)
+        i = _idx(i, len(store.data["faq"]))
+        if i is None or field not in ("q", "a"):
+            return faq_view(msg_id)
+        return ask("faqset", "Введите " + ("новый вопрос:" if field == "q" else "новый ответ:"), i=i, field=field)
     if data.startswith("faqtop:"):
-        i = int(data.split(":")[1])
+        i = _idx(data.split(":")[1], len(store.data["faq"]))
+        if i is None:
+            return faq_view(msg_id)
         f = store.data["faq"].pop(i)
         store.data["faq"].insert(0, f)
         store.save("faq reorder")
         return faq_view(msg_id)
     if data.startswith("faqdel:"):
-        i = int(data.split(":")[1])
+        i = _idx(data.split(":")[1], len(store.data["faq"]))
+        if i is None:
+            return faq_view(msg_id)
         store.data["faq"].pop(i)
         store.save("delete faq")
         return faq_view(msg_id)
@@ -997,15 +1157,21 @@ def handle_callback(cq):
     if data == "managers":
         return managers_view(msg_id)
     if data.startswith("mgr:"):
-        return manager_view(int(data.split(":")[1]), msg_id)
+        i = _idx(data.split(":")[1], len(store.data.get("managers", [])))
+        return manager_view(i if i is not None else 0, msg_id)
     if data == "mgr_add":
         return ask("mgr_add", "Пришлите данные менеджера (каждое с новой строки):\n<code>Имя\n+380XXXXXXXXX\nДолжность (необязательно)\nСсылка Telegram (необязательно)\nСсылка WhatsApp (необязательно)</code>\n\nПример:\n<code>Олексій\n+380966973130\nМенеджер з перевезень\nhttps://t.me/pereviznyk_support</code>")
     if data.startswith("mset:"):
         _, i, field = data.split(":")
         hints = {"name": "Новое имя:", "role": "Новая должность:", "phone": "Номер: <code>+380XXXXXXXXX</code>", "telegram": "Ссылка t.me/… или «auto»", "whatsapp": "Ссылка wa.me/… или «auto»"}
-        return ask("mset", hints[field], i=int(i), field=field)
+        i = _idx(i, len(store.data.get("managers", [])))
+        if i is None or field not in hints:
+            return managers_view(msg_id)
+        return ask("mset", hints[field], i=i, field=field)
     if data.startswith("mup:"):
-        i = int(data.split(":")[1])
+        i = _idx(data.split(":")[1], len(store.data.get("managers", [])))
+        if i is None:
+            return managers_view(msg_id)
         ms = store.data["managers"]
         if i > 0:
             ms[i-1], ms[i] = ms[i], ms[i-1]
@@ -1069,7 +1235,7 @@ def handle_callback(cq):
     if data.startswith("aset:"):
         return ask("aset", "Текст объявления:" if data.endswith("text") else "Ссылка или «-»:", field=data.split(":")[1])
     if data == "atoggle":
-        a = store.data["site"]["announcement"]
+        a = store.data["site"].setdefault("announcement", {"enabled": False, "text": "", "link": ""})
         a["enabled"] = not a.get("enabled")
         store.save(f"announcement enabled={a['enabled']}")
         return announce_view(msg_id)
@@ -1083,7 +1249,7 @@ def handle_callback(cq):
     if data == "admins":
         return admins_view(msg_id)
     if data == "cast":
-        pending[cur_chat()] = dict(action="cast")
+        pending[cur_chat()] = dict(action="cast", ts=time.time())
         return send("Текст рассылки всем админам:", ikb([[("✖️ Отмена", "cancel")]]))
     if data == "cast_yes":
         p = pending.pop(cur_chat(), {}) or {}
@@ -1092,8 +1258,8 @@ def handle_callback(cq):
         n = 0
         for uid in admin_ids():
             try:
-                send("📣 <b>Рассылка</b>\n\n" + esc(p["text"]), chat_id=uid)
-                n += 1
+                if send("📣 <b>Рассылка</b>\n\n" + esc(p["text"]), chat_id=uid).get("ok"):
+                    n += 1
             except Exception:
                 pass
         return edit(msg_id, f"✅ Разослано админам: {n}.", ikb([[("⬅️ Меню", "main")]]))
@@ -1108,7 +1274,7 @@ def handle_callback(cq):
         if not is_owner(cur_chat()):
             return send("Только владелец может удалять администраторов.")
         uid = int(data.split(":")[1])
-        store.state["admins"] = [a for a in store.state["admins"] if int(a["id"]) != uid]
+        store.state["admins"] = [a for a in store.state.get("admins", []) if _aid(a) != uid]
         store.save_state(silent=True)
         send("Ваш доступ администратора отозван.", chat_id=uid)
         return admins_view(msg_id)
@@ -1119,36 +1285,50 @@ def handle_callback(cq):
         return stats_view(msg_id)
 
     if data.startswith("lead_done:"):
-        i = int(data.split(":")[1])
-        ls = store.state.get("leads", [])
-        if 0 <= i < len(ls):
-            ls[i]["done"] = True; mark_dirty()
+        ref = data.split(":")[1]
+        _di, _dl = _lead_by_ref(ref)
+        if _dl is not None:
+            _dl["done"] = True; mark_dirty()
         try:
             old = cq["message"].get("text") or ""
-            edit(msg_id, esc(old) + "\n\n✅ <b>Обработано</b>", ikb([[("↩️ Вернуть", f"lead_undo:{i}")]]))
+            edit(msg_id, esc(old) + "\n\n✅ <b>Обработано</b>", ikb([[("↩️ Вернуть", f"lead_undo:{ref}")]]))
         except Exception:
             pass
         return
     if data.startswith("lead_undo:"):
-        i = int(data.split(":")[1]); ls = store.state.get("leads", [])
-        if 0 <= i < len(ls):
-            ls[i]["done"] = False; mark_dirty()
-        return edit(msg_id, "Заявка возвращена в работу.", ikb([[("✅ Обработано", f"lead_done:{i}")]]))
+        ref = data.split(":")[1]
+        _ui, _ul = _lead_by_ref(ref)
+        if _ul is not None:
+            _ul["done"] = False; mark_dirty()
+        return edit(msg_id, "Заявка возвращена в работу.", ikb([[("✅ Обработано", f"lead_done:{ref}")]]))
     if data.startswith("revpub:"):
-        i = int(data.split(":")[1]); ls = store.state.get("leads", [])
-        if 0 <= i < len(ls):
-            _f = {_norm_key(_k): _v for _k, _v in (ls[i].get("fields") or {}).items()}
+        ref = data.split(":")[1]
+        _ri, _rl = _lead_by_ref(ref)
+        if _rl is None or _rl.get("type") != "review":
+            try:
+                edit(msg_id, "⚠️ Заявка уже недоступна.", None)
+            except Exception:
+                pass
+            return
+        if _rl.get("pub"):
+            try:
+                edit(msg_id, "✅ Этот отзыв уже опубликован.", None)
+            except Exception:
+                pass
+            return
+        if True:
+            _f = {_norm_key(_k): _v for _k, _v in (_rl.get("fields") or {}).items()}
             try:
                 stars = max(1, min(5, int(str(_f.get("\u041e\u0446\u0456\u043d\u043a\u0430") or _f.get("Оценка") or "5").strip()[0])))
             except Exception:
                 stars = 5
-            t = ls[i].get("t") or ""
+            t = _rl.get("t") or ""
             day = (t[8:10] + "." + t[5:7] + "." + t[:4]) if len(t) >= 10 and t[4:5] == "-" else t[:10]
             r = {"name": str(_f.get("\u0406\u043c\u044f") or _f.get("Имя") or "Гость").strip() or "Гость",
                  "date": day, "text": str(_f.get("\u0412\u0456\u0434\u0433\u0443\u043a") or _f.get("Отзыв") or "").strip(), "stars": stars}
             store.data["reviews"].insert(0, r)
             store.save(f"publish review {r['name']}")
-            ls[i]["done"] = True; mark_dirty()
+            _rl["done"] = True; _rl["pub"] = True; mark_dirty()
         try:
             edit(msg_id, "✅ Отзыв опубликован на сайте.", None)
         except Exception:
@@ -1156,9 +1336,10 @@ def handle_callback(cq):
         return
 
     if data.startswith("revrej:"):
-        i = int(data.split(":")[1]); ls = store.state.get("leads", [])
-        if 0 <= i < len(ls):
-            ls[i]["done"] = True; mark_dirty()
+        ref = data.split(":")[1]
+        _ji, _jl = _lead_by_ref(ref)
+        if _jl is not None:
+            _jl["done"] = True; mark_dirty()
         try:
             edit(msg_id, "❌ Отзыв отклонён.", None)
         except Exception:
@@ -1168,11 +1349,23 @@ def handle_callback(cq):
         leads = store.state.get("leads", [])[-10:]
         def _fmt(l):
             try:
-                d = json.loads(l["text"]); return ", ".join(f"{k}: {v}" for k, v in d.items() if v and k not in ("path", "title"))
+                d = json.loads(l.get("text") or "")
+                if isinstance(d, dict):
+                    return ", ".join(f"{k}: {v}" for k, v in d.items() if v and k not in ("path", "title"))
             except Exception:
-                return l["text"]
-        txt = "<b>Заявки</b> · последние 10\n\n" + ("\n\n".join(f"{'✅' if l.get('done') else '🆕'} {esc(l['t'][5:16].replace('T',' '))} {esc(l.get('kind',''))}\n{esc(_fmt(l))}" for l in leads) or "Пока нет")
-        return edit(msg_id, txt, ikb([[("🗑 Очистить", "leads_clear"), ("⬅️ Меню", "main")]]))
+                pass
+            return l.get("text") or ""
+        def _when(l):
+            t = str(l.get("t") or "")
+            return t[5:16].replace("T", " ") if len(t) >= 16 else t
+        txt = "<b>Заявки</b> · последние 10\n\n" + ("\n\n".join(f"{'✅' if l.get('done') else '🆕'} {esc(_when(l))} {esc(l.get('kind',''))}\n{esc(_fmt(l))[:300]}" for l in leads) or "Пока нет")
+        rows = []
+        for l in leads:
+            if not l.get("done") and l.get("lid"):
+                rows.append([(f"✅ {l.get('kind') or 'Заявка'}", f"lead_done:{l['lid']}")])
+        rows = rows[-8:]
+        rows.append([("🗑 Очистить", "leads_clear"), ("⬅️ Меню", "main")])
+        return edit(msg_id, txt, ikb(rows))
 
 
 def num(s):
@@ -1198,11 +1391,15 @@ def handle_text(text):
         body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{cur_chat()}\r\n"
                 f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"site.json\"\r\nContent-Type: application/json\r\n\r\n").encode() + content + f"\r\n--{boundary}--\r\n".encode()
         req = urllib.request.Request(API + "sendDocument", data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
-        urllib.request.urlopen(req, timeout=60).read()
+        try:
+            urllib.request.urlopen(req, timeout=60).read()
+        except Exception as e:
+            log.warning("backup failed: %s", e)
+            return send("❌ Не удалось отправить бэкап.")
         return
     if not p:
         # free text from admin = treat as note/lead
-        store.state.setdefault("leads", []).append({"t": dt.datetime.utcnow().isoformat(), "text": text})
+        store.state.setdefault("leads", []).append({"t": dt.datetime.utcnow().isoformat(), "text": text, "kind": "📝 Заметка", "fields": {}, "type": "note", "done": False, "rem": 0, "lid": _new_lid()})
         store.state["leads"] = store.state["leads"][-100:]
         store.save_state(silent=True)
         return send("📝 Сохранено как заметку", main_menu())
@@ -1212,7 +1409,7 @@ def handle_text(text):
         if a == "cast":
             if not text.strip():
                 return send("❌ Пустое сообщение. Введите текст или /cancel")
-            pending[cur_chat()] = dict(action="cast_ok", text=text.strip())
+            pending[cur_chat()] = dict(action="cast_ok", text=text.strip(), ts=time.time())
             return send(f"Разослать {len(admin_ids())} админам?\n\n{esc(text.strip())}",
                         ikb([[("✅ Разослать", "cast_yes"), ("✖️ Отмена", "cast_no")]]))
         if a == "admin_add":
@@ -1221,7 +1418,7 @@ def handle_text(text):
             name = parts[1].strip() if len(parts) > 1 else str(uid)
             if uid == OWNER_ID:
                 return send("Это ваш собственный ID — вы и так владелец.")
-            if any(int(x["id"]) == uid for x in store.state["admins"]):
+            if any(_aid(x) == uid for x in store.state.get("admins", [])):
                 return send("Такой администратор уже есть.")
             store.state["admins"].append({"id": uid, "name": name, "added": dt.datetime.utcnow().isoformat()})
             store.save_state(silent=True)
@@ -1230,7 +1427,10 @@ def handle_text(text):
                 send("⚠️ Не удалось написать новому админу — он должен сначала нажать /start в боте. Доступ уже выдан.")
             return admins_view()
         if a == "rset":
-            r = store.data["routes"][p["i"]]
+            _rs = store.data["routes"]
+            if not (0 <= p.get("i", -1) < len(_rs)):
+                return routes_view(0)
+            r = _rs[p["i"]]
             if p["field"] == "badge":
                 r["badge"] = "" if text.strip() in ("-", "—") else text.strip()[:20]
             else:
@@ -1239,25 +1439,48 @@ def handle_text(text):
             store.save(f"route {r['from']}→{r['to']} {p['field']}={r.get(p['field'])}")
             return route_view(p["i"])
         if a == "route_add":
-            parts = [x.strip() for x in text.replace("–", "-").replace("—", "-").split("-")]
-            if len(parts) < 2:
+            rx = text.replace("–", "-").replace("—", "-")
+            parts = [x.strip() for x in rx.split(" - ")] if " - " in rx else [x.strip() for x in rx.split("-")]
+            if len(parts) < 2 or not parts[0] or not parts[1]:
                 raise ValueError("format")
-            r = {"from": parts[0], "to": parts[1], "price": None, "old_price": None, "slug": "", "visible": True}
+            frm, to = parts[0], parts[1]
+            if any(r.get("from") == frm and r.get("to") == to for r in store.data["routes"]):
+                send("⚠️ Такой маршрут уже есть.")
+                return routes_view(len(store.data["routes"]) // PAGE)
+            r = {"from": frm, "to": to, "price": None, "old_price": None, "slug": "", "visible": True}
             store.data["routes"].append(r)
-            res = road_hours(r["from"], r["to"])
-            if res:
-                store.data.setdefault("durations", {})[f"{r['from']}|{r['to']}"] = {"hours": round(res[0] + float(pricing_cfg()["extra_hours"]), 1), "km": int(round(res[1])), "src": "osrm"}
-            store.save(f"add route {r['from']}→{r['to']}")
-            _pc = price_for(r["from"], r["to"])
-            send(f"✅ Добавлено. В пути ~{_pc['hours']} ч → Comfort {_pc['uah']} ₴" if _pc else "✅ Добавлено, но время в пути не удалось рассчитать (проверьте названия городов).")
-            return routes_view(len(store.data["routes"]) // PAGE)
+            try:
+                store.save(f"add route {frm}→{to}")
+            except Exception:
+                store.data["routes"].pop()
+                raise
+            chat = cur_chat()
+            send("⏳ Маршрут добавлен, считаю время в пути…")
+            def _job(frm=frm, to=to, chat=chat):
+                CTX.chat = chat
+                try:
+                    res = road_hours(frm, to)
+                    if res:
+                        store.data.setdefault("durations", {})[f"{frm}|{to}"] = {"hours": round(res[0] + float(pricing_cfg()["extra_hours"]), 1), "km": int(round(res[1])), "src": "osrm"}
+                        store.save(f"durations +{frm}→{to}")
+                    _pc = price_for(frm, to)
+                    send(f"✅ В пути ~{_pc['hours']} ч → Comfort {_pc['uah']} ₴" if _pc else "✅ Добавлено, но время в пути не удалось рассчитать (проверьте названия городов).")
+                    routes_view(len(store.data["routes"]) // PAGE)
+                except Exception as e:
+                    log.exception("route_add job")
+                    send(f"❌ Ошибка: {esc(str(e))}")
+            threading.Thread(target=_job, daemon=True).start()
+            return
         if a == "bulk":
             pct = float(text.replace("%", "").replace("+", "").strip())
             for r in store.data["routes"]:
-                if r.get("price"):
-                    r["price"] = int(round(r["price"] * (1 + pct / 100) / 100.0) * 100)
-                if r.get("old_price"):
-                    r["old_price"] = int(round(r["old_price"] * (1 + pct / 100) / 100.0) * 100)
+                for k in ("price", "old_price"):
+                    try:
+                        v = float(r.get(k) or 0)
+                    except Exception:
+                        continue
+                    if v > 0:
+                        r[k] = int(round(v * (1 + pct / 100) / 100.0) * 100)
             store.save(f"bulk prices {pct:+.1f}%")
             return routes_view(0)
         if a == "review_add":
@@ -1269,6 +1492,8 @@ def handle_text(text):
             store.save(f"add review {r['name']}")
             return reviews_view()
         if a == "faqset":
+            if not (0 <= p.get("i", -1) < len(store.data["faq"])) or p.get("field") not in ("q", "a"):
+                return faq_view()
             store.data["faq"][p["i"]][p["field"]] = text.strip()
             store.save("edit faq")
             return faq_view()
@@ -1285,7 +1510,9 @@ def handle_text(text):
             store.save(f"add manager {m['name']}")
             return managers_view()
         if a == "mset":
-            ms = store.data["managers"]
+            ms = store.data.get("managers", [])
+            if not (0 <= p.get("i", -1) < len(ms)):
+                return managers_view()
             m = ms[p["i"]]
             v = text.strip()
             f = p["field"]
@@ -1335,6 +1562,10 @@ def handle_text(text):
                 nums = [float(x) for x in line.replace("€", "").replace(",", ".").split()]
                 if len(nums) == 4:
                     rows.append([int(nums[0]) if nums[0].is_integer() else nums[0], int(nums[1]) if nums[1].is_integer() else nums[1], int(nums[2]), int(nums[3])])
+            rows.sort(key=lambda r: r[0])
+            for w in rows:
+                if w[1] <= w[0] or w[0] < 0 or w[2] <= 0 or w[3] <= 0:
+                    raise ValueError("tiers")
             if len(rows) < 2:
                 raise ValueError("tiers")
             pricing_cfg()["tiers"] = rows
@@ -1365,7 +1596,7 @@ def handle_text(text):
             store.save("advantages")
             return hero_view()
         if a == "aset":
-            an = store.data["site"]["announcement"]
+            an = store.data["site"].setdefault("announcement", {"enabled": False, "text": "", "link": ""})
             an[p["field"]] = "" if text.strip() in ("-", "—") else text.strip()
             if p["field"] == "text" and an["text"]:
                 an["enabled"] = True
@@ -1384,6 +1615,9 @@ def handle_update(u):
     if not is_admin(uid):
         return  # ignore everyone else silently
     CTX.chat = uid
+    _pp = pending.get(uid)
+    if _pp and "ts" in _pp and time.time() - _pp.get("ts", 0) > 1800:
+        pending.pop(uid, None)
     if frm.get("first_name") and uid == OWNER_ID and store.state.get("owner_name") != frm.get("first_name"):
         store.state["owner_name"] = frm.get("first_name"); mark_dirty()
     try:
@@ -1405,7 +1639,16 @@ def handle_update(u):
 
 def main():
     tg("deleteWebhook", drop_pending_updates=False)
-    store.load()
+    for _att in range(5):
+        try:
+            store.load()
+            break
+        except Exception as e:
+            log.warning("initial load failed (%s), retry %d/5", e, _att + 1)
+            time.sleep(10)
+    else:
+        log.error("cannot load data at startup, exiting")
+        raise SystemExit(1)
     tg("setMyCommands", commands=[
         {"command": "menu", "description": "Админ-панель"},
         {"command": "site", "description": "Ссылка на сайт"},
@@ -1417,8 +1660,6 @@ def main():
     log.info("started; admin=%s repo=%s runtime=%ss state_mode=%s", ADMIN_ID, GH_REPO, MAX_RUNTIME, "encrypted" if STATE_SECRET else "redacted")
     if not STATE_SECRET:
         log.warning("STATE_SECRET is not set; leads are kept only in memory and redacted in bot/state.json")
-    if os.environ.get("NOTIFY_START") == "1":
-        broadcast("🤖 Бот онлайн · /menu", main_menu())
     stop = {"flag": False}
     signal.signal(signal.SIGTERM, lambda *a: stop.__setitem__("flag", True))
     threading.Thread(target=bridge_listener, args=(stop,), daemon=True).start()
