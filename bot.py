@@ -25,17 +25,32 @@ import urllib.error
 import re
 import threading
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ.get("ADMIN_ID") or "7906546417")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+
+
+def _parse_admin_id(val, fallback=7906546417):
+    if not val:
+        return fallback
+    digits = "".join(ch for ch in str(val) if ch.isdigit())
+    try:
+        return int(digits) if digits else fallback
+    except Exception:
+        return fallback
+
+
+OWNER_ID = _parse_admin_id(os.environ.get("ADMIN_ID", "7906546417"))
 ADMIN_ID = OWNER_ID  # kept for backwards compat (owner chat)
 NTFY = "https://ntfy.sh/"
-GH_TOKEN = os.environ["GH_TOKEN"]
+GH_TOKEN = os.environ.get("GH_TOKEN", "").strip()
 GH_REPO = os.environ.get("GH_REPO", "Pashawilliams/bez-mezh-site")
 GH_BRANCH = os.environ.get("GH_BRANCH", "main")
 DATA_PATH = "data/site.json"
 STATE_PATH = "bot/state.json"
 SITE_URL = os.environ.get("SITE_URL", "http://bez-mezh.pp.ua/")
-MAX_RUNTIME = int(os.environ.get("MAX_RUNTIME") or str(5 * 3600 + 20 * 60))  # 5h20m
+try:
+    MAX_RUNTIME = int(os.environ.get("MAX_RUNTIME") or str(5 * 3600 + 20 * 60))  # 5h20m
+except Exception:
+    MAX_RUNTIME = 19200
 STATE_SECRET = os.environ.get("STATE_SECRET", "").strip()
 START = time.time()
 
@@ -129,7 +144,7 @@ def esc(s):
 
 # ----------------------------------------------------------------- GitHub storage
 
-GH_H = {"Authorization": f"token {GH_TOKEN}", "Accept": "application/vnd.github+json"}
+GH_H = {"Authorization": f"token {GH_TOKEN}", "Accept": "application/vnd.github+json"} if GH_TOKEN else {"Accept": "application/vnd.github+json"}
 
 
 def default_state():
@@ -245,24 +260,69 @@ class Store:
         self.sha = None
         self.state = default_state()
         self.state_sha = None
+        self._lock = threading.Lock()
 
     def load(self):
-        r = http(f"https://api.github.com/repos/{GH_REPO}/contents/{DATA_PATH}?ref={GH_BRANCH}", headers=GH_H)
-        self.sha = r["sha"]
-        self.data = json.loads(base64.b64decode(r["content"]).decode())
-        try:
-            r = http(f"https://api.github.com/repos/{GH_REPO}/contents/{STATE_PATH}?ref={GH_BRANCH}", headers=GH_H)
-            self.state_sha = r["sha"]
-            raw_state = json.loads(base64.b64decode(r["content"]).decode())
-            self.state = decrypt_state(raw_state)
-        except urllib.error.HTTPError:
-            self.state_sha = None
-            self.state = default_state()
+        loaded = False
+        if GH_TOKEN:
+            for attempt in range(4):
+                try:
+                    r = http(f"https://api.github.com/repos/{GH_REPO}/contents/{DATA_PATH}?ref={GH_BRANCH}", headers=GH_H)
+                    if r.get("sha") and r.get("content"):
+                        self.sha = r["sha"]
+                        self.data = json.loads(base64.b64decode(r["content"]).decode("utf-8"))
+                        loaded = True
+                        break
+                except Exception as e:
+                    log.warning("attempt %d fetching %s from GitHub API failed: %s", attempt + 1, DATA_PATH, e)
+                    if attempt < 3:
+                        time.sleep(2 + attempt)
+                        continue
+
+        # Fallback to raw.githubusercontent.com
+        if not loaded:
+            try:
+                raw_url = f"https://raw.githubusercontent.com/{GH_REPO}/{GH_BRANCH}/{DATA_PATH}"
+                req = urllib.request.Request(raw_url, headers={"User-Agent": "site-admin-bot"})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    self.data = json.loads(resp.read().decode("utf-8"))
+                    loaded = True
+                    log.info("loaded %s via raw fallback", DATA_PATH)
+            except Exception as e:
+                log.warning("raw fallback load failed: %s", e)
+
+        if not loaded or not isinstance(self.data, dict):
+            self.data = {"site": {"name": "БЕЗ МЕЖ"}, "routes": [], "reviews": [], "faq": [], "contacts": {}}
+
+        loaded_state = False
+        if GH_TOKEN:
+            try:
+                r = http(f"https://api.github.com/repos/{GH_REPO}/contents/{STATE_PATH}?ref={GH_BRANCH}", headers=GH_H)
+                if r.get("sha") and r.get("content"):
+                    self.state_sha = r["sha"]
+                    raw_state = json.loads(base64.b64decode(r["content"]).decode("utf-8"))
+                    self.state = decrypt_state(raw_state)
+                    loaded_state = True
+            except Exception as e:
+                log.debug("cannot load state via API: %s", e)
+
+        if not loaded_state:
+            try:
+                raw_state_url = f"https://raw.githubusercontent.com/{GH_REPO}/{GH_BRANCH}/{STATE_PATH}"
+                req = urllib.request.Request(raw_state_url, headers={"User-Agent": "site-admin-bot"})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    raw_state = json.loads(resp.read().decode("utf-8"))
+                    self.state = decrypt_state(raw_state)
+            except Exception:
+                self.state_sha = None
+                self.state = default_state()
+
         if not isinstance(self.state, dict):
             self.state = default_state()
         for k, v in (("leads", []), ("log", []), ("admins", []), ("chats", {}), ("banned", []), ("dialogs", {})):
             self.state.setdefault(k, v)
-        self.data.setdefault("managers", [])
+        if isinstance(self.data, dict):
+            self.data.setdefault("managers", [])
         return self.data
 
     def _put(self, path, obj, sha, msg):
@@ -270,18 +330,35 @@ class Store:
         body = {"message": msg, "content": content, "branch": GH_BRANCH}
         if sha:
             body["sha"] = sha
+        if not GH_TOKEN:
+            log.warning("GH_TOKEN is missing, cannot write %s to GitHub", path)
+            return None
         for attempt in range(3):
             try:
                 r = http(f"https://api.github.com/repos/{GH_REPO}/contents/{path}", body, GH_H, method="PUT")
-                return r["content"]["sha"]
+                if r.get("content") and r["content"].get("sha"):
+                    return r["content"]["sha"]
             except urllib.error.HTTPError as e:
-                if e.code in (409, 422) and attempt < 2:
-                    # sha out of date -> refetch and retry
-                    cur = http(f"https://api.github.com/repos/{GH_REPO}/contents/{path}?ref={GH_BRANCH}", headers=GH_H)
-                    body["sha"] = cur["sha"]
-                    time.sleep(1)
-                    continue
-                raise
+                err_text = ""
+                try:
+                    err_text = e.read().decode()
+                except Exception:
+                    pass
+                log.warning("gh put %s failed (attempt %d): %s %s", path, attempt + 1, e.code, err_text[:200])
+                if e.code in (409, 422):
+                    try:
+                        cur = http(f"https://api.github.com/repos/{GH_REPO}/contents/{path}?ref={GH_BRANCH}", headers=GH_H)
+                        body["sha"] = cur.get("sha")
+                    except Exception:
+                        pass
+                elif e.code == 403:
+                    log.warning("GitHub token lacks write permissions for %s", path)
+                    break
+                time.sleep(1 + attempt)
+            except Exception as e:
+                log.warning("gh put %s error: %s", path, e)
+                time.sleep(1 + attempt)
+        return None
 
     def save(self, msg):
         self.data["updated_at"] = dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1638,24 +1715,28 @@ def handle_update(u):
 # ----------------------------------------------------------------- main loop
 
 def main():
-    tg("deleteWebhook", drop_pending_updates=False)
-    for _att in range(5):
-        try:
-            store.load()
-            break
-        except Exception as e:
-            log.warning("initial load failed (%s), retry %d/5", e, _att + 1)
-            time.sleep(10)
-    else:
-        log.error("cannot load data at startup, exiting")
-        raise SystemExit(1)
-    tg("setMyCommands", commands=[
-        {"command": "menu", "description": "Админ-панель"},
-        {"command": "site", "description": "Ссылка на сайт"},
-        {"command": "admins", "description": "Администраторы"},
-        {"command": "backup", "description": "Выгрузить site.json"},
-        {"command": "cancel", "description": "Отменить ввод"},
-    ])
+    if not BOT_TOKEN:
+        log.error("BOT_TOKEN is not configured! Sleeping before exit.")
+        time.sleep(60)
+        return
+    try:
+        tg("deleteWebhook", drop_pending_updates=False)
+    except Exception as e:
+        log.warning("deleteWebhook failed: %s", e)
+    try:
+        store.load()
+    except Exception as e:
+        log.exception("store.load() error: %s", e)
+    try:
+        tg("setMyCommands", commands=[
+            {"command": "menu", "description": "Админ-панель"},
+            {"command": "site", "description": "Ссылка на сайт"},
+            {"command": "admins", "description": "Администраторы"},
+            {"command": "backup", "description": "Выгрузить site.json"},
+            {"command": "cancel", "description": "Отменить ввод"},
+        ])
+    except Exception as e:
+        log.warning("setMyCommands failed: %s", e)
     offset = store.state.get("offset", 0)
     log.info("started; admin=%s repo=%s runtime=%ss state_mode=%s", ADMIN_ID, GH_REPO, MAX_RUNTIME, "encrypted" if STATE_SECRET else "redacted")
     if not STATE_SECRET:

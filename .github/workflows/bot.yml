@@ -7,7 +7,7 @@ on:
     - cron: "*/30 * * * *"
 
 permissions:
-  contents: read
+  contents: write
   actions: write
 
 concurrency:
@@ -57,7 +57,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
-          GH_TOKEN: ${{ secrets.GH_PAT }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           GH_REPO: Pashawilliams/bez-mezh-site
           GH_BRANCH: main
           SITE_URL: http://bez-mezh.pp.ua/
@@ -83,7 +83,8 @@ jobs:
           if [ "${PREV_FAILS:-0}" -ge 3 ]; then
             echo "Too many consecutive failures - NOT chaining a new run."
             if [ "$PREV_FAILS" = "3" ]; then
-              CHAT="${ADMIN_CHAT:-7906546417}"
+              CLEAN_CHAT=$(echo "${ADMIN_CHAT:-7906546417}" | tr -cd '0-9')
+              CHAT="${CLEAN_CHAT:-7906546417}"
               curl -s --max-time 20 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
                 --data-urlencode "chat_id=${CHAT}" \
                 --data-urlencode "text=🚨 Админ-бот bez-mezh падает при старте 3 раза подряд. Автоперезапуск остановлен, нужен фикс." || true
